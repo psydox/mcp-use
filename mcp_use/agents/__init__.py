@@ -1,15 +1,18 @@
 """
-MCP agent modules.
+Agent implementations for using MCP tools.
 
-This package provides agent implementations that integrate various components
-for using MCP tools with different LLM providers.
+This module provides ready-to-use agent implementations
+that are pre-configured for using MCP tools.
 """
 
+from .base import BaseAgent
 from .mcpagent import MCPAgent
+
+# Import components
 from .server_manager import ServerManager
 
 __all__ = [
-    # Main agent classes
+    "BaseAgent",
     "MCPAgent",
     "ServerManager",
 ]
