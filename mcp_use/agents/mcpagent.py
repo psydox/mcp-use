@@ -72,7 +72,8 @@ class MCPAgent:
 
         # System prompt configuration
         self.system_prompt = system_prompt
-        self.system_prompt_template = system_prompt_template or self.DEFAULT_SYSTEM_PROMPT_TEMPLATE
+        template = system_prompt_template or self.DEFAULT_SYSTEM_PROMPT_TEMPLATE
+        self.system_prompt_template = template
         self.additional_instructions = additional_instructions
 
         # Either client or connector must be provided
@@ -100,16 +101,17 @@ class MCPAgent:
                 self._sessions = await self.client.create_all_sessions()
             connectors_to_use = [session.connector for session in self._sessions.values()]
         else:
-            # Using direct connector
+            # Using direct connector - only establish connection
+            # LangChainAdapter will handle initialization
             connectors_to_use = self.connectors
             for connector in connectors_to_use:
-                await connector.connect()
-                await connector.initialize()
+                if not hasattr(connector, "client") or connector.client is None:
+                    await connector.connect()
 
         # Create the system message based on available tools
         await self._create_system_message(connectors_to_use)
 
-        # Create LangChain tools using the adapter
+        # Create LangChain tools using the adapter (adapter will handle initialization if needed)
         self._tools = await self.adapter.create_langchain_tools(connectors_to_use)
 
         # Create the agent
@@ -130,6 +132,14 @@ class MCPAgent:
         # Otherwise, build the system prompt from the template and tool descriptions
         tool_descriptions = []
         for connector in connectors:
+            # We might need to initialize the connector to get its tools
+            if not hasattr(connector, "tools") or not connector.tools:
+                try:
+                    await connector.initialize()
+                except Exception as e:
+                    logger.error(f"Error initializing connector: {e}")
+                    continue
+
             tools = connector.tools
             # Generate tool descriptions
             for tool in tools:
@@ -139,9 +149,9 @@ class MCPAgent:
 
                 # Escape curly braces in the description by doubling them
                 # (sometimes e.g. blender mcp they are used in the description)
-                description = (
-                    f"- {tool.name}: {tool.description.replace('{', '{{').replace('}', '}}')}"
-                )
+                # Format: "- tool_name: tool_description"
+                escaped_desc = tool.description.replace("{", "{{").replace("}", "}}")
+                description = f"- {tool.name}: {escaped_desc}"
                 tool_descriptions.append(description)
 
         # Format the system prompt template with tool descriptions
