@@ -1,0 +1,205 @@
+from langchain_core.tools import BaseTool, StructuredTool
+from pydantic import BaseModel, Field
+
+from mcp_use.client import MCPClient
+from mcp_use.logging import logger
+
+from ..adapters.langchain_adapter import LangChainAdapter
+
+
+class ServerActionInput(BaseModel):
+    """Base input for server-related actions"""
+
+    server_name: str = Field(description="The name of the MCP server")
+
+
+class ListServersInput(BaseModel):
+    """Empty input for listing available servers"""
+
+    pass
+
+
+class CurrentServerInput(BaseModel):
+    """Empty input for checking current server"""
+
+    pass
+
+
+class ServerManager:
+    """Manages MCP servers and provides tools for server selection and management.
+
+    This class allows an agent to discover and select which MCP server to use,
+    dynamically activating the tools for the selected server.
+    """
+
+    def __init__(self, client: MCPClient, adapter: LangChainAdapter) -> None:
+        """Initialize the server manager.
+
+        Args:
+            client: The MCPClient instance managing server connections
+            adapter: The LangChainAdapter for converting MCP tools to LangChain tools
+        """
+        self.client = client
+        self.adapter = adapter
+        self.active_server: str | None = None
+        self.initialized_servers: dict[str, bool] = {}
+        self._server_tools: dict[str, list[BaseTool]] = {}
+
+    async def initialize(self) -> None:
+        """Initialize the server manager and prepare server management tools."""
+        # Make sure we have server configurations
+        if not self.client.get_server_names():
+            logger.warning("No MCP servers defined in client configuration")
+
+    async def get_server_management_tools(self) -> list[BaseTool]:
+        """Get tools for managing server connections.
+
+        Returns:
+            List of LangChain tools for server management
+        """
+        # Create structured tools for server management with direct parameter passing
+        list_servers_tool = StructuredTool.from_function(
+            coroutine=self.list_servers,
+            name="list_mcp_servers",
+            description="Lists all available MCP servers that can be connected to",
+            args_schema=ListServersInput,
+        )
+
+        connect_server_tool = StructuredTool.from_function(
+            coroutine=self.connect_to_server,
+            name="connect_to_mcp_server",
+            description="Connect to a specific MCP server to use its tools",
+            args_schema=ServerActionInput,
+        )
+
+        get_active_server_tool = StructuredTool.from_function(
+            coroutine=self.get_active_server,
+            name="get_active_mcp_server",
+            description="Get the currently active MCP server",
+            args_schema=CurrentServerInput,
+        )
+
+        switch_server_tool = StructuredTool.from_function(
+            coroutine=self.switch_server,
+            name="switch_mcp_server",
+            description="Switch to a different MCP server",
+            args_schema=ServerActionInput,
+        )
+
+        return [
+            list_servers_tool,
+            connect_server_tool,
+            get_active_server_tool,
+            switch_server_tool,
+        ]
+
+    async def list_servers(self) -> str:
+        """List all available MCP servers.
+
+        Returns:
+            String listing all available servers
+        """
+        servers = self.client.get_server_names()
+        if not servers:
+            return "No MCP servers are currently defined."
+
+        result = "Available MCP servers:\n"
+        for i, server in enumerate(servers):
+            active_marker = " (ACTIVE)" if server == self.active_server else ""
+            result += f"{i+1}. {server}{active_marker}\n"
+
+        return result
+
+    async def connect_to_server(self, server_name: str) -> str:
+        """Connect to a specific MCP server.
+
+        Args:
+            server_name: The name of the server to connect to
+
+        Returns:
+            Status message about the connection
+        """
+        # Check if server exists
+        servers = self.client.get_server_names()
+        if server_name not in servers:
+            available = ", ".join(servers) if servers else "none"
+            return f"Server '{server_name}' not found. Available servers: {available}"
+
+        # If we're already connected to this server, just return
+        if self.active_server == server_name:
+            return f"Already connected to MCP server '{server_name}'"
+
+        try:
+            # Create or get session for this server
+            try:
+                session = self.client.get_session(server_name)
+                logger.debug(f"Using existing session for server '{server_name}'")
+            except ValueError:
+                logger.debug(f"Creating new session for server '{server_name}'")
+                session = await self.client.create_session(server_name)
+
+            # Set as active server
+            self.active_server = server_name
+
+            # Initialize server tools if not already initialized
+            if server_name not in self._server_tools:
+                connector = session.connector
+                self._server_tools[server_name] = await self.adapter.create_langchain_tools(
+                    [connector]
+                )
+                self.initialized_servers[server_name] = True
+
+            num_tools = len(self._server_tools.get(server_name, []))
+            return (
+                f"Connected to MCP server '{server_name}'. " f"{num_tools} tools are now available."
+            )
+
+        except Exception as e:
+            logger.error(f"Error connecting to server '{server_name}': {e}")
+            return f"Failed to connect to server '{server_name}': {str(e)}"
+
+    async def get_active_server(self) -> str:
+        """Get the currently active MCP server.
+
+        Returns:
+            Name of the active server or message if none is active
+        """
+        if not self.active_server:
+            return (
+                "No MCP server is currently active. "
+                "Use connect_to_mcp_server to connect to a server."
+            )
+        return f"Currently active MCP server: {self.active_server}"
+
+    async def switch_server(self, server_name: str) -> str:
+        """Switch to a different MCP server.
+
+        Args:
+            server_name: The name of the server to switch to
+
+        Returns:
+            Status message about the switch
+        """
+        # This is just an alias for connect_to_server for clarity in the UI
+        return await self.connect_to_server(server_name)
+
+    async def get_active_server_tools(self) -> list[BaseTool]:
+        """Get the tools for the currently active server.
+
+        Returns:
+            List of LangChain tools for the active server or empty list if no active server
+        """
+        if not self.active_server:
+            return []
+
+        return self._server_tools.get(self.active_server, [])
+
+    async def get_all_tools(self) -> list[BaseTool]:
+        """Get all tools - both server management tools and tools for the active server.
+
+        Returns:
+            Combined list of server management tools and active server tools
+        """
+        management_tools = await self.get_server_management_tools()
+        active_server_tools = await self.get_active_server_tools()
+        return management_tools + active_server_tools
